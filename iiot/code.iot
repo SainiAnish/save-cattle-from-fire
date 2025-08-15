@@ -1,0 +1,276 @@
+/************************************************************
+ * Project: Save Cattle from Fire (IoT)
+ * Board  : ESP8266 NodeMCU
+ * Sensors: Flame (digital), Flex sensor (analog A0)
+ * Output : Servo (rope release) OR Solenoid (via relay/MOSFET), Buzzer
+ * Cloud  : Blynk 2.0 (optional but enabled here)
+ *
+ * BEFORE UPLOADING:
+ * 1) Install libraries: Blynk (v2), ESP8266 boards, ESP8266Servo
+ * 2) Fill WiFi + Blynk credentials below.
+ * 3) In Blynk Console, create Events: "fire_alert", "released", "tamper"
+ * 4) Wire per the pin map in comments.
+ ************************************************************/
+
+// -------- Blynk credentials --------
+#define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"
+#define BLYNK_DEVICE_NAME   "SaveCattle"
+#define BLYNK_AUTH_TOKEN    "YOUR_AUTH_TOKEN"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <ESP8266WiFiMulti.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <time.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <Servo.h>            // Use "ESP8266Servo" library
+
+// -------- Wi-Fi ----------
+char ssid[] = "YourWiFiSSID";
+char pass[] = "YourWiFiPassword";
+
+// -------- Pin Map (NodeMCU labels) ----------
+/*
+  D1  -> FLAME_PIN (digital out from sensor; many modules: LOW = fire)
+  A0  -> FLEX_PIN  (voltage divider with flex sensor)
+  D5  -> SERVO_PIN (rope release horn)
+  D6  -> BUZZER_PIN (PWM buzzer)
+  D7  -> SOLENOID_PIN (optional; drives relay/MOSFET; HIGH=energize)
+  D2  -> STATUS_LED (optional onboard LED if wired external)
+*/
+
+#define FLAME_PIN     D1
+#define FLEX_PIN      A0
+#define SERVO_PIN     D5
+#define BUZZER_PIN    D6
+#define SOLENOID_PIN  D7     // optional; keep if using solenoid lock
+#define STATUS_LED    LED_BUILTIN  // on-board LED (LOW = ON on ESP8266)
+
+// -------- Blynk Virtual Pins ----------
+#define V_ARM_TOGGLE  V0   // 1=armed, 0=disarmed
+#define V_MANUAL_REL  V1   // button: manual release
+#define V_MANUAL_LOCK V2   // button: manual lock/reset
+#define V_TEST_SIREN  V3   // button: beep 3s
+#define V_FLAME_VAL   V4   // display 0/1
+#define V_FLEX_VAL    V5   // display raw 0..1023
+#define V_STATUS      V6   // status text
+#define V_RELEASED    V7   // indicator 0/1
+#define V_THRESH_SET  V8   // slider to tweak flex tied threshold
+
+// -------- Runtime state ----------
+BlynkTimer timer;
+ESP8266WiFiMulti wifiMulti;
+Servo lockServo;
+
+bool systemArmed = true;          // arming switch
+bool ropeEngaged = false;         // based on flex reading
+bool ropeReleased = false;        // state of lock
+bool buzzerActive = false;
+
+int  flexBaseline = 0;            // learned at boot
+int  flexTiedThreshold = 90;      // delta above baseline that means "tied"
+int  flameActiveLevel = LOW;      // many flame modules pull LOW on fire
+
+// Servo positions (tune for your lock hardware)
+const int SERVO_LOCK_POS   = 20;   // rope locked/latched
+const int SERVO_RELEASE_POS= 110;  // rope released
+
+// Debounce & timing
+unsigned long lastFlameMs = 0;
+const unsigned long flameHoldMs = 300;   // need flame for >=300ms
+unsigned long lastFlexMs = 0;
+const unsigned long flexSampleMs = 150;
+
+// Safety: after release, keep siren for:
+const unsigned long sirenAfterReleaseMs = 20000;
+
+// --------------- Utility ---------------
+void setStatus(const String& s) {
+  Serial.println(s);
+  Blynk.virtualWrite(V_STATUS, s);
+}
+
+void sirenOn() {
+  buzzerActive = true;
+  analogWrite(BUZZER_PIN, 700);  // PWM ~beep
+  digitalWrite(STATUS_LED, LOW); // LED on
+}
+
+void sirenOff() {
+  buzzerActive = false;
+  analogWrite(BUZZER_PIN, 0);
+  digitalWrite(STATUS_LED, HIGH); // LED off
+}
+
+// Drive release using either servo or solenoid (or both)
+void doRelease() {
+  ropeReleased = true;
+  lockServo.write(SERVO_RELEASE_POS);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, HIGH);  // energize to release if using solenoid
+  Blynk.virtualWrite(V_RELEASED, 1);
+}
+
+void doLock() {
+  ropeReleased = false;
+  lockServo.write(SERVO_LOCK_POS);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
+  Blynk.virtualWrite(V_RELEASED, 0);
+}
+
+// Read sensors
+int readFlame() {
+  int v = digitalRead(FLAME_PIN);
+  int fire = (v == flameActiveLevel) ? 1 : 0;
+  Blynk.virtualWrite(V_FLAME_VAL, fire);
+  return fire;
+}
+
+int readFlex() {
+  int raw = analogRead(FLEX_PIN); // 0..1023 (higher = more bend/tension depending wiring)
+  Blynk.virtualWrite(V_FLEX_VAL, raw);
+  return raw;
+}
+
+// Determine rope engaged by comparing to baseline
+bool calcRopeEngaged(int raw) {
+  int delta = abs(raw - flexBaseline);
+  return (delta >= flexTiedThreshold);
+}
+
+// --------------- Core Logic ---------------
+void evaluateSystem() {
+  // Sample sensors
+  int fire = readFlame();
+  int flex = readFlex();
+
+  // ropeEngaged update (with small debounce)
+  static bool lastEngaged = false;
+  static unsigned long engagedChangeMs = 0;
+  bool engagedNow = calcRopeEngaged(flex);
+  if (engagedNow != lastEngaged) {
+    engagedChangeMs = millis();
+    lastEngaged = engagedNow;
+  }
+  if (millis() - engagedChangeMs > 200) {
+    ropeEngaged = engagedNow;
+  }
+
+  // If fire steady for a short time AND system armed AND rope is engaged → release
+  if (systemArmed && ropeEngaged && (fire == 1)) {
+    if (lastFlameMs == 0) lastFlameMs = millis();
+    if (millis() - lastFlameMs >= flameHoldMs) {
+      setStatus("FIRE DETECTED → Releasing rope and sounding siren!");
+      sirenOn();
+      if (!ropeReleased) {
+        doRelease();
+        // Notify cloud (if online)
+        Blynk.logEvent("fire_alert", "Fire detected in stable - rope auto-released");
+        Blynk.logEvent("released",   "Rope mechanism triggered");
+      }
+    }
+  } else {
+    lastFlameMs = 0;
+  }
+
+  // Keep siren active for a while after release/fire
+  static unsigned long sirenStart = 0;
+  if (buzzerActive && sirenStart == 0) sirenStart = millis();
+  if (buzzerActive && (millis() - sirenStart >= sirenAfterReleaseMs)) {
+    sirenOff();
+    sirenStart = 0;
+  }
+}
+
+// --------------- Blynk Handlers ---------------
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(V_ARM_TOGGLE, V_THRESH_SET);
+  setStatus("Connected to Blynk");
+}
+
+BLYNK_WRITE(V_ARM_TOGGLE) {
+  systemArmed = param.asInt();
+  setStatus(systemArmed ? "System ARMED" : "System DISARMED");
+}
+
+BLYNK_WRITE(V_MANUAL_REL) {
+  if (param.asInt()) {
+    setStatus("Manual release triggered from app");
+    sirenOn();
+    doRelease();
+    Blynk.logEvent("released", "Manual release from app");
+  }
+}
+
+BLYNK_WRITE(V_MANUAL_LOCK) {
+  if (param.asInt()) {
+    setStatus("Manual lock/reset from app");
+    sirenOff();
+    doLock();
+  }
+}
+
+BLYNK_WRITE(V_TEST_SIREN) {
+  if (param.asInt()) {
+    setStatus("Siren test: 3 seconds");
+    sirenOn();
+    timer.setTimeout(3000, [](){ sirenOff(); });
+  }
+}
+
+BLYNK_WRITE(V_THRESH_SET) {
+  flexTiedThreshold = param.asInt(); // allow 20..300 typical
+  setStatus(String("Flex tied threshold set to Δ") + flexTiedThreshold);
+}
+
+// --------------- Setup & Loop ---------------
+void calibrateFlexBaseline() {
+  setStatus("Calibrating flex baseline (keep rope UN-TENSIONED)...");
+  long sum = 0;
+  const int N = 40;
+  for (int i=0; i<N; i++) {
+    sum += analogRead(FLEX_PIN);
+    delay(40);
+  }
+  flexBaseline = sum / N;
+  setStatus(String("Flex baseline = ") + flexBaseline);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // Pins
+  pinMode(FLAME_PIN, INPUT_PULLUP);   // many modules idle HIGH, pull LOW on fire
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, HIGH);
+  analogWrite(BUZZER_PIN, 0);
+
+  // Servo
+  lockServo.attach(SERVO_PIN);
+  doLock();     // default safe: locked
+
+  // Calibrate flex sensor
+  calibrateFlexBaseline();
+
+  // Wi-Fi + Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // Periodic tasks
+  timer.setInterval(200, evaluateSystem);    // fast safety loop
+  timer.setInterval(1500, [](){              // heartbeat/status
+    Blynk.virtualWrite(V_RELEASED, ropeReleased ? 1 : 0);
+  });
+
+  setStatus("Boot complete. System ARMED by default.");
+}
+
+void loop() {
+  Blynk.run();   // if Wi-Fi is down, local logic still runs
+  timer.run();
+}
