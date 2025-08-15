@@ -1,18 +1,16 @@
 # save-cattle-from-fire
 
-Project Title
-Save Cattle from Fire using IoT
 
-Objective
+Objective : 
 To design an IoT-based safety system that detects fire in cattle stables and automatically frees the cattle by releasing the ropes, while simultaneously triggering an alarm to alert farmers.
 
-Problem Statement
+Problem Statement : 
 In rural and farming areas, cattle are often tied to poles inside stables. In case of a fire outbreak (due to electrical faults, dry fodder ignition, or other accidents), the animals cannot escape as they are tied. This leads to injuries or death. There is often no immediate human presence to rescue them.
 
-Proposed Solution
+Proposed Solution : 
 We implement an IoT-based system using fire sensors and a servo/solenoid rope release mechanism. The system detects fire, alerts the farmer via buzzer and IoT notification, and automatically unties the cattle by loosening the rope.
 
-Components Used
+Components Used : 
 Arduino/NodeMCU (ESP8266) – Microcontroller to process sensor data and control release mechanism.
 
 Fire/Flame Sensor – Detects flames or sudden temperature rise.
@@ -28,7 +26,7 @@ IoT Module (Wi-Fi) – Sends alert notifications to farmer’s mobile.
 Power Supply / Battery – To keep system running even during power cuts.
 
 
-Working Principle
+Working Principle : 
 
 Normal Condition: Cattle are tied to a pole with the rope attached to a servo lock system. Sensors are active but idle.
 
@@ -48,7 +46,7 @@ Manual Reset: Once danger is over, farmer can re-tie cattle and reset the system
 
 
 
-Implementation Steps
+Implementation Steps : 
 
 Install flame sensors at multiple points in the stable for full coverage.
 
@@ -70,7 +68,7 @@ Test in a controlled environment before deploying in actual stables.
 
 
 
-Advantages
+Advantages : 
 
 Saves cattle lives by giving them a way to escape.
 
@@ -82,7 +80,7 @@ Low cost and easy to install.
 
 
 
-Future Enhancements
+Future Enhancements :
 
 Add smoke sensor for early fire detection.
 
